@@ -5,10 +5,15 @@ import sys
 import os
 import asyncio
 
-# Set environment variables from Streamlit secrets
-if hasattr(st, 'secrets'):
-    os.environ["NVIDIA_API_KEY"] = st.secrets.get("NVIDIA_API_KEY", "")
-    os.environ["DATABASE_URL"] = st.secrets.get("DATABASE_URL", "")
+# ==================== SECRETS SETUP ====================
+# Load secrets from Streamlit Cloud
+try:
+    if 'NVIDIA_API_KEY' in st.secrets:
+        os.environ['NVIDIA_API_KEY'] = st.secrets['NVIDIA_API_KEY']
+    if 'DATABASE_URL' in st.secrets:
+        os.environ['DATABASE_URL'] = st.secrets['DATABASE_URL']
+except Exception as e:
+    print(f"Note: Could not load secrets: {e}")
 
 # Add current directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))

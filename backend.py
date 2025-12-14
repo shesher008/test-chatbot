@@ -13,25 +13,6 @@ import os
 import sys
 import atexit
 
-# Add this at the VERY TOP of backend.py
-import os
-import sys
-
-# Try to load from Streamlit secrets first (for deployment)
-try:
-    import streamlit as st
-    if hasattr(st, 'secrets'):
-        # Override environment variables from Streamlit secrets
-        if "NVIDIA_API_KEY" in st.secrets:
-            os.environ["NVIDIA_API_KEY"] = st.secrets["NVIDIA_API_KEY"]
-        if "DATABASE_URL" in st.secrets:
-            os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
-        print("✅ Loaded secrets from Streamlit")
-except ImportError:
-    pass  # Streamlit not available, fall back to .env
-except Exception as e:
-    print(f"⚠️ Could not load Streamlit secrets: {e}")
-
 # ==================== 1. CRITICAL INITIALIZATION STEPS ====================
 
 # WINDOWS FIX - Alternative approach
@@ -274,47 +255,56 @@ def should_continue(state: ChatState) -> Literal["tools", END]:
 checkpointer = None
 
 async def _init_checkpointer():
-    """Initialize PostgreSQL connection and Checkpointer with explicit schema."""
-    database_url = os.getenv("DATABASE_URL")
+    """Initialize PostgreSQL connection and Checkpointer."""
+    def get_db_url():
+        """Get database URL from multiple sources"""
+        # 1. Try Streamlit secrets (for production)
+        try:
+            import streamlit as st
+            if 'DATABASE_URL' in st.secrets:
+                return st.secrets['DATABASE_URL']
+        except:
+            pass
+        
+        # 2. Try environment variable
+        db_url = os.getenv("DATABASE_URL")
+        if db_url:
+            return db_url
+        
+        # 3. Try constructing from .env variables
+        db_host = os.getenv("DB_HOST")
+        db_user = os.getenv("DB_USER")
+        db_password = os.getenv("DB_PASSWORD")
+        db_name = os.getenv("DB_NAME")
+        
+        if all([db_host, db_user, db_password, db_name]):
+            return f"postgresql://{db_user}:{db_password}@{db_host}:5432/{db_name}?sslmode=require"
+        
+        return None
+    
+    database_url = get_db_url()
     
     if not database_url:
-        print("❌ CRITICAL: DATABASE_URL not found in .env file.", file=sys.stderr)
-        raise ValueError("DATABASE_URL environment variable is required.")
+        print("❌ CRITICAL: No database configuration found.", file=sys.stderr)
+        print("Please set DATABASE_URL in Streamlit Secrets or environment variables.", file=sys.stderr)
+        return None
     
     print("🔗 Initializing Neon PostgreSQL Checkpointer...")
     
     try:
-        # 1. Create the saver with explicit table configurations
-        saver = AsyncPostgresSaver.from_conn_string(
-            database_url,
-            # Explicit table names (optional but good practice)
-            checkpoint_table_name="langgraph_checkpoints",
-            metadata_table_name="langgraph_metadata",
-            # Optional: Custom schema
-            # schema_name="langgraph_schema"
-        )
+        # FIXED: Remove the unsupported parameters
+        saver = AsyncPostgresSaver.from_conn_string(database_url)
         
-        # 2. Initialize database schema with explicit setup
+        # Initialize database schema
         await saver.setup()
         print("✅ Neon PostgreSQL database connected successfully!")
-        
-        # 3. Verify the expected columns exist
-        # LangGraph typically creates these columns automatically:
-        # - thread_id: VARCHAR (or TEXT)
-        # - checkpoint: JSONB (for storing state)
-        # - checkpoint_id: SERIAL/BIGSERIAL (auto-incrementing ID)
-        # - parent_checkpoint_id: BIGINT (for checkpoint chains)
-        # - created_at: TIMESTAMP
-        # - metadata: JSONB (additional metadata)
-        
-        # For your custom state field (current_model), it will be stored
-        # within the 'checkpoint' JSONB column as part of the state object
         
         return saver
         
     except Exception as e:
         print(f"❌ Error connecting to database: {e}", file=sys.stderr)
-        raise
+        print("The app will run without persistence.", file=sys.stderr)
+        return None
 
 # Run the async initialization synchronously
 try:
