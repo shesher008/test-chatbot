@@ -215,7 +215,7 @@ with st.sidebar:
                 load_previous_chat(thread_id)
 
 # =========================== Main Chat Interface ===========================
-st.title("💬 Multi-Model Chatbot")
+st.title("💬 Multi-Model Chatbot Presented by SHESHER HASAN")
 
 # Backend Status Warning
 if not BACKEND_LOADED:
