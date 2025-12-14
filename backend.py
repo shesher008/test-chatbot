@@ -4,7 +4,8 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, To
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph.message import add_messages
-from langchain_core.tools import tool
+from langchain_core.tools import Tool,tool, BaseTool
+from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from dotenv import load_dotenv
 import asyncio
 import threading
@@ -12,33 +13,37 @@ import os
 import sys
 import atexit
 
-# Add this near the top of backend.py (after imports, before Windows fix)
-import streamlit as st
+# Add this at the VERY TOP of backend.py
+import os
+import sys
 
-# Load from Streamlit secrets if available
+# Try to load from Streamlit secrets first (for deployment)
 try:
+    import streamlit as st
     if hasattr(st, 'secrets'):
-        # Set environment variables from Streamlit secrets
+        # Override environment variables from Streamlit secrets
         if "NVIDIA_API_KEY" in st.secrets:
             os.environ["NVIDIA_API_KEY"] = st.secrets["NVIDIA_API_KEY"]
         if "DATABASE_URL" in st.secrets:
             os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
-except:
-    pass  # Continue with .env file if not in Streamlit
+        print("✅ Loaded secrets from Streamlit")
+except ImportError:
+    pass  # Streamlit not available, fall back to .env
+except Exception as e:
+    print(f"⚠️ Could not load Streamlit secrets: {e}")
 
 # ==================== 1. CRITICAL INITIALIZATION STEPS ====================
 
-# --- START: WINDOWS FIX (Must be applied before creating any loop) ---
-# CRITICAL FIX for Windows/Psycopg/Asyncio conflict
+# WINDOWS FIX - Alternative approach
 if sys.platform == "win32":
     try:
         from asyncio import WindowsSelectorEventLoopPolicy
-        # Set the policy globally
-        asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
-        print("✅ Windows async policy set for database compatibility.")
+        # Only set if not already set
+        if not isinstance(asyncio.get_event_loop_policy(), WindowsSelectorEventLoopPolicy):
+            asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
+            print("✅ Windows async policy set for database compatibility.")
     except ImportError:
-        pass 
-# --- END: WINDOWS FIX ---
+        pass
 
 # Load environment variables (CRITICAL: Must be at the top)
 load_dotenv()
@@ -72,12 +77,12 @@ class LLMManager:
         
         # Initialize models only once
         self.models = {
-            "coding": ChatNVIDIA(model="qwen/qwen3-coder-480b-a35b-instruct", temperature=0.2, top_p=0.9),
+            "coding": ChatNVIDIA(model="qwen/qwen3-235b-a22b", temperature=0.2, top_p=0.9),
             "chatting": ChatNVIDIA(model="meta/llama-3.3-70b-instruct", temperature=0.7, top_p=0.95),
-            "pentesting": ChatNVIDIA(model="igenius/colosseum_355b_instruct_16k", temperature=0.3, top_p=0.9),
+            "pentesting": ChatNVIDIA(model="qwen/qwen3-235b-a22b", temperature=0.3, top_p=0.9),
             "math": ChatNVIDIA(model="qwen/qwen3-next-80b-a3b-thinking", temperature=0.1, top_p=0.8),
             "creative": ChatNVIDIA(model="meta/llama-3.1-405b-instruct", temperature=0.8, top_p=0.95),
-            "default": ChatNVIDIA(model="meta/llama-3.3-70b-instruct", temperature=0.5, top_p=0.9)
+            "default": ChatNVIDIA(model="meta/llama-3.1-70b-instruct", temperature=0.5, top_p=0.9)
         }
     
     def detect_model_type(self, user_input: str) -> str:
@@ -112,27 +117,51 @@ def select_model(model_type: str) -> str:
     # NOTE: The actual state update happens in execute_tools
     return f"Success: Request to switch to {model_type} model submitted."
 
-tools = [select_model]
+# DuckDuckGo search tool
+@tool
+def duckduckgo_search(query: str) -> str:
+    """
+    Perform an internet search using DuckDuckGo and return the results.
+    
+    This function utilizes the DuckDuckGoSearchAPIWrapper to execute web searches
+    without tracking or personalized filtering. It's particularly useful for
+    obtaining factual information, current events, and general web content.
+    
+    Args:
+        query (str): The search query string. Can include keywords, questions,
+                     or search terms. For best results, be specific and concise.
+    
+    Returns:
+        str: A string containing the search results summary. The format typically
+             includes relevant web snippets, titles, and brief descriptions.
+    
+    Example:
+        >>> results = duckduckgo_search("Python programming tutorials")
+        >>> print(results[:200])  # First 200 characters of results
+    
+    Notes:
+        - Results are not personalized (unlike some search engines)
+        - No search history is tracked
+        - Rate limits may apply with extensive use
+        - Results quality may vary based on query specificity
+    """
+    search = DuckDuckGoSearchAPIWrapper()
+    return search.run(query)
+
+
+# Add tools to the list
+tools = [select_model, duckduckgo_search]
 
 # ==================== 5. State ====================
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     current_model: str
-    recursion_count: Annotated[int, "counter"]
 
 # ==================== 6. Graph Nodes ====================
 async def chat_node(state: ChatState):
-    """Main chat node with recursion limit"""
+    """Main chat node with NO recursion limit"""
     messages = state["messages"]
     current_model = state.get("current_model", "default")
-    recursion_count = state.get("recursion_count", 0)
-    
-    if recursion_count >= 3:
-        return {
-            "messages": [AIMessage(content="I've reached my thinking limit for this turn. Please rephrase your question or start a new chat.")],
-            "current_model": current_model,
-            "recursion_count": recursion_count + 1
-        }
     
     last_user_message = next((msg.content for msg in reversed(messages) if isinstance(msg, HumanMessage)), None)
     
@@ -158,22 +187,20 @@ Current question: {last_user_message or 'No question'}
     
     return {
         "messages": [response],
-        "current_model": current_model,
-        "recursion_count": recursion_count + 1
+        "current_model": current_model
     }
 
 async def execute_tools(state: ChatState):
     """Execute tool calls and update state if model is switched."""
     messages = state["messages"]
-    recursion_count = state.get("recursion_count", 0)
     current_model = state.get("current_model", "default")
     
     if not messages:
-        return {"messages": [], "recursion_count": recursion_count + 1}
+        return {"messages": [], "current_model": current_model}
     
     last_message = messages[-1]
     results = []
-    new_model = current_model
+    new_model = current_model  # Start with current model
     
     if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
         for tool_call in last_message.tool_calls:
@@ -185,12 +212,14 @@ async def execute_tools(state: ChatState):
                     try:
                         result = tool_func.invoke(tool_args)
                         
-                        # --- CRITICAL FIX: Check for select_model tool execution ---
-                        if tool_name == "select_model" and "Success" in result:
+                        # Better model switching logic
+                        if tool_name == "select_model":
                             requested_model = tool_args.get("model_type", "default")
                             if requested_model in llm_manager.models:
-                                new_model = requested_model # State update
-                        # -----------------------------------------------------------
+                                new_model = requested_model
+                                result = f"Model switched to {requested_model}"
+                            else:
+                                result = f"Error: Model '{requested_model}' not found"
                         
                         results.append({
                             "tool_call_id": tool_call.get('id', ''),
@@ -213,21 +242,19 @@ async def execute_tools(state: ChatState):
                 name=res["tool_name"]
             ))
         
-        # Return state update: Messages, increment count, and the NEW model if switched
+        # Return state update: Messages and the NEW model if switched
         return {
             "messages": tool_messages,
-            "current_model": new_model, # <<-- Persists the change
-            "recursion_count": recursion_count + 1
+            "current_model": new_model # <<-- Persists the change
         }
     
-    return {"messages": [], "recursion_count": recursion_count + 1}
+    return {"messages": [], "current_model": current_model}
 
 def should_continue(state: ChatState) -> Literal["tools", END]:
-    """Determine whether to use tools or end - PREVENTS INFINITE LOOPS"""
+    """Determine whether to use tools or end - NO RECURSION LIMIT"""
     messages = state["messages"]
-    recursion_count = state.get("recursion_count", 0)
     
-    if recursion_count >= 3 or not messages:
+    if not messages:
         return END
     
     last_message = messages[-1]
@@ -244,13 +271,10 @@ def should_continue(state: ChatState) -> Literal["tools", END]:
 
 # ==================== 7. Checkpointer Initialization ====================
 # Global variable to hold the checkpointer instance
-checkpointer = None 
-saver_context_manager = None # Global to hold the context manager for cleanup
+checkpointer = None
 
 async def _init_checkpointer():
-    """Initialize PostgreSQL connection and Checkpointer, and register cleanup."""
-    global saver_context_manager # Use global variable
-    
+    """Initialize PostgreSQL connection and Checkpointer with explicit schema."""
     database_url = os.getenv("DATABASE_URL")
     
     if not database_url:
@@ -259,50 +283,43 @@ async def _init_checkpointer():
     
     print("🔗 Initializing Neon PostgreSQL Checkpointer...")
     
-    saver = None 
-    
     try:
-        # 1. Get the asynchronous context manager
-        saver_context_manager = AsyncPostgresSaver.from_conn_string(database_url)
-
-        # 2. Asynchronously enter the context manager to get the actual saver instance
-        saver = await saver_context_manager.__aenter__() 
+        # 1. Create the saver with explicit table configurations
+        saver = AsyncPostgresSaver.from_conn_string(
+            database_url,
+            # Explicit table names (optional but good practice)
+            checkpoint_table_name="langgraph_checkpoints",
+            metadata_table_name="langgraph_metadata",
+            # Optional: Custom schema
+            # schema_name="langgraph_schema"
+        )
         
-        # 3. Initialize database schema
-        await saver.setup() 
+        # 2. Initialize database schema with explicit setup
+        await saver.setup()
         print("✅ Neon PostgreSQL database connected successfully!")
         
-        # 4. Register a cleanup function to be run when the program exits
-        def cleanup_checkpointer():
-            if _ASYNC_LOOP.is_running() and saver_context_manager:
-                try:
-                    # Submit the async exit to the dedicated loop and wait for it
-                    future = asyncio.run_coroutine_threadsafe(saver_context_manager.__aexit__(None, None, None), _ASYNC_LOOP)
-                    future.result(timeout=5)
-                    print("✅ Neon PostgreSQL checkpointer cleaned up.")
-                except Exception as e:
-                    print(f"⚠️ Error during checkpointer cleanup: {e}")
-            
-        atexit.register(cleanup_checkpointer)
-
+        # 3. Verify the expected columns exist
+        # LangGraph typically creates these columns automatically:
+        # - thread_id: VARCHAR (or TEXT)
+        # - checkpoint: JSONB (for storing state)
+        # - checkpoint_id: SERIAL/BIGSERIAL (auto-incrementing ID)
+        # - parent_checkpoint_id: BIGINT (for checkpoint chains)
+        # - created_at: TIMESTAMP
+        # - metadata: JSONB (additional metadata)
+        
+        # For your custom state field (current_model), it will be stored
+        # within the 'checkpoint' JSONB column as part of the state object
+        
         return saver
         
     except Exception as e:
         print(f"❌ Error connecting to database: {e}", file=sys.stderr)
-        
-        # Explicit cleanup if we failed after entering the context
-        if saver and saver_context_manager:
-            try:
-                await saver_context_manager.__aexit__(None, None, None)
-            except:
-                pass 
         raise
 
 # Run the async initialization synchronously
 try:
     checkpointer = run_async(_init_checkpointer())
 except Exception as e:
-    # Set checkpointer to None if initialization fails to allow limited run
     print(f"⚠️ Checkpointer initialization failed. Error: {e}. Chat history will NOT be persistent.")
     checkpointer = None
 
@@ -333,6 +350,7 @@ async def _alist_threads():
     except Exception as e:
         # The 'connection is closed' error should now be caught here
         print(f"Error retrieving threads: {e}") 
+        return []
     return list(all_threads)
 
 def retrieve_all_threads():
@@ -351,17 +369,23 @@ async def switch_model_async(thread_id: str, model_type: str) -> dict:
         return {"success": False, "error": f"Model {model_type} not available"}
     
     try:
-        state = chatbot.get_state(config={"configurable": {"thread_id": thread_id}})
+        # FIX: Use await for async state retrieval
+        state = await chatbot.aget_state(config={"configurable": {"thread_id": thread_id}})
         
-        # Update the model in the state dictionary (in memory)
+        # Update the model in the state dictionary
         state.values["current_model"] = model_type
         
-        # Save the new state back using the checkpointer's update logic
+        # FIX: Save the complete state - CORRECT VERSION
+        # LangGraph's checkpointer expects specific parameters
         await checkpointer.aput(
             config={"configurable": {"thread_id": thread_id}},
-            checkpoint=state.config.get("checkpoint"), 
-            metadata={"source": "manual_switch"},
-            channel_values={"current_model": model_type} # Explicitly update this channel
+            # The checkpoint should be a dict with 'config' and 'values'
+            checkpoint={
+                "config": state.config,
+                "values": state.values,
+                "next": ("chat",)  # Specify where to continue
+            },
+            metadata={"source": "manual_switch"}
         )
         
         return {"success": True, "new_model": model_type}
@@ -371,6 +395,18 @@ async def switch_model_async(thread_id: str, model_type: str) -> dict:
 def switch_model_sync(thread_id: str, model_type: str) -> dict:
     """Synchronous wrapper for switch_model_async."""
     return run_async(switch_model_async(thread_id, model_type))
+
+# Add at the end of the file (before __main__ check)
+def cleanup():
+    """Cleanup function for database connections."""
+    if _ASYNC_LOOP.is_running():
+        # Cancel any pending tasks
+        for task in asyncio.all_tasks(_ASYNC_LOOP):
+            task.cancel()
+        _ASYNC_LOOP.call_soon_threadsafe(_ASYNC_LOOP.stop)
+
+# Register cleanup
+atexit.register(cleanup)
 
 # ==================== 10. Initialization Check ====================
 if __name__ == "__main__":
