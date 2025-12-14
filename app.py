@@ -113,7 +113,7 @@ def load_previous_chat(thread_id):
 
 # =========================== Sidebar ===========================
 with st.sidebar:
-    st.title("🤖 Multi-Model Chatbot")
+    st.title("🤖 Multi-Model Chatbot Created by Shesher")
     
     # Backend Status
     if st.session_state.backend_loaded:
