@@ -13,6 +13,13 @@ import os
 import sys
 import atexit
 
+# Re-add asyncpg for manual context manager handling
+try:
+    import asyncpg
+except ImportError:
+    print("❌ CRITICAL: 'asyncpg' module missing. Please run: pip install asyncpg")
+    sys.exit(1)
+
 # ==================== 1. CRITICAL INITIALIZATION STEPS ====================
 
 # WINDOWS FIX - Alternative approach
@@ -34,6 +41,10 @@ load_dotenv()
 _ASYNC_LOOP = asyncio.new_event_loop()
 _ASYNC_THREAD = threading.Thread(target=_ASYNC_LOOP.run_forever, daemon=True)
 _ASYNC_THREAD.start()
+
+# --- GLOBAL CONNECTION OBJECT ---
+_SAVER_CONTEXT_MANAGER = None # Stores the context manager from from_conn_string
+# --------------------------------
 
 def _submit_async(coro):
     """Submits a coroutine to the async thread and waits for the result (Synchronous Block)."""
@@ -89,7 +100,7 @@ llm_manager = LLMManager()
 def select_model(model_type: str) -> str:
     """
     Select which LLM model to use. 
-    Available: coding, chatting, pentesting, math, creative, default
+    Available: coding, chatting, pentesting, math, creative, default.
     The execution of this tool will update the model used for the next chat turn.
     """
     available_models = list(llm_manager.models.keys())
@@ -105,26 +116,13 @@ def duckduckgo_search(query: str) -> str:
     Perform an internet search using DuckDuckGo and return the results.
     
     This function utilizes the DuckDuckGoSearchAPIWrapper to execute web searches
-    without tracking or personalized filtering. It's particularly useful for
-    obtaining factual information, current events, and general web content.
+    for obtaining factual information, current events, and general web content.
     
     Args:
-        query (str): The search query string. Can include keywords, questions,
-                     or search terms. For best results, be specific and concise.
+        query (str): The search query string.
     
     Returns:
-        str: A string containing the search results summary. The format typically
-             includes relevant web snippets, titles, and brief descriptions.
-    
-    Example:
-        >>> results = duckduckgo_search("Python programming tutorials")
-        >>> print(results[:200])  # First 200 characters of results
-    
-    Notes:
-        - Results are not personalized (unlike some search engines)
-        - No search history is tracked
-        - Rate limits may apply with extensive use
-        - Results quality may vary based on query specificity
+        str: A string containing the search results summary.
     """
     search = DuckDuckGoSearchAPIWrapper()
     return search.run(query)
@@ -162,7 +160,8 @@ IMPORTANT RULES:
 Current question: {last_user_message or 'No question'}
 """
     system_message = SystemMessage(content=system_content)
-    enhanced_messages = [system_message] + messages[-4:]
+    # Only pass the last few messages to conserve token context
+    enhanced_messages = [system_message] + messages[-4:] 
     
     response = await llm_with_tools.ainvoke(enhanced_messages)
     
@@ -181,7 +180,7 @@ async def execute_tools(state: ChatState):
     
     last_message = messages[-1]
     results = []
-    new_model = current_model  # Start with current model
+    new_model = current_model
     
     if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
         for tool_call in last_message.tool_calls:
@@ -193,7 +192,7 @@ async def execute_tools(state: ChatState):
                     try:
                         result = tool_func.invoke(tool_args)
                         
-                        # Better model switching logic
+                        # Model switching logic
                         if tool_name == "select_model":
                             requested_model = tool_args.get("model_type", "default")
                             if requested_model in llm_manager.models:
@@ -226,7 +225,7 @@ async def execute_tools(state: ChatState):
         # Return state update: Messages and the NEW model if switched
         return {
             "messages": tool_messages,
-            "current_model": new_model # <<-- Persists the change
+            "current_model": new_model
         }
     
     return {"messages": [], "current_model": current_model}
@@ -250,15 +249,16 @@ def should_continue(state: ChatState) -> Literal["tools", END]:
     
     return END
 
-# ==================== 7. Checkpointer Initialization ====================
+# ==================== 7. Checkpointer Initialization (Final Unwrapper Fix) ====================
 # Global variable to hold the checkpointer instance
 checkpointer = None
 
 async def _init_checkpointer():
-    """Initialize PostgreSQL connection and Checkpointer."""
+    """Initialize PostgreSQL connection and Checkpointer using string constructor and manual unwrapping."""
+    global _SAVER_CONTEXT_MANAGER
+    
     def get_db_url():
         """Get database URL from multiple sources"""
-        # 1. Try Streamlit secrets (for production)
         try:
             import streamlit as st
             if 'DATABASE_URL' in st.secrets:
@@ -266,12 +266,10 @@ async def _init_checkpointer():
         except:
             pass
         
-        # 2. Try environment variable
         db_url = os.getenv("DATABASE_URL")
         if db_url:
             return db_url
         
-        # 3. Try constructing from .env variables
         db_host = os.getenv("DB_HOST")
         db_user = os.getenv("DB_USER")
         db_password = os.getenv("DB_PASSWORD")
@@ -292,14 +290,22 @@ async def _init_checkpointer():
     print("🔗 Initializing Neon PostgreSQL Checkpointer...")
     
     try:
-        # FIXED: Remove the unsupported parameters
-        saver = AsyncPostgresSaver.from_conn_string(database_url)
+        # --- CRITICAL FIX START: Manual Unwrapping for old library version ---
         
-        # Initialize database schema
+        # 1. Get the context manager returned by the function.
+        _SAVER_CONTEXT_MANAGER = AsyncPostgresSaver.from_conn_string(database_url)
+        
+        # 2. Manually enter the context manager to get the actual saver object.
+        saver = await _SAVER_CONTEXT_MANAGER.__aenter__()
+
+        # 3. Initialize database schema
         await saver.setup()
-        print("✅ Neon PostgreSQL database connected successfully!")
         
+        print("✅ Neon PostgreSQL database connected successfully!")
+        print("✅ Neon PostgreSQL checkpointer ready!")
         return saver
+        
+        # --- CRITICAL FIX END ---
         
     except Exception as e:
         print(f"❌ Error connecting to database: {e}", file=sys.stderr)
@@ -334,11 +340,9 @@ async def _alist_threads():
         return []
     all_threads = set()
     try:
-        # Check if the checkpointer is active before trying to use it
         async for checkpoint in checkpointer.alist(None):
             all_threads.add(checkpoint.config["configurable"]["thread_id"])
     except Exception as e:
-        # The 'connection is closed' error should now be caught here
         print(f"Error retrieving threads: {e}") 
         return []
     return list(all_threads)
@@ -359,21 +363,19 @@ async def switch_model_async(thread_id: str, model_type: str) -> dict:
         return {"success": False, "error": f"Model {model_type} not available"}
     
     try:
-        # FIX: Use await for async state retrieval
+        # Get current state
         state = await chatbot.aget_state(config={"configurable": {"thread_id": thread_id}})
         
         # Update the model in the state dictionary
         state.values["current_model"] = model_type
         
-        # FIX: Save the complete state - CORRECT VERSION
-        # LangGraph's checkpointer expects specific parameters
+        # Save the complete state
         await checkpointer.aput(
             config={"configurable": {"thread_id": thread_id}},
-            # The checkpoint should be a dict with 'config' and 'values'
             checkpoint={
                 "config": state.config,
                 "values": state.values,
-                "next": ("chat",)  # Specify where to continue
+                "next": ("chat",)
             },
             metadata={"source": "manual_switch"}
         )
@@ -389,8 +391,15 @@ def switch_model_sync(thread_id: str, model_type: str) -> dict:
 # Add at the end of the file (before __main__ check)
 def cleanup():
     """Cleanup function for database connections."""
+    global _SAVER_CONTEXT_MANAGER
+    
+    # Manually schedule the async exit of the context manager for graceful shutdown
+    if _SAVER_CONTEXT_MANAGER and _ASYNC_LOOP.is_running():
+        # Schedule the coroutine on the background loop
+        asyncio.run_coroutine_threadsafe(_SAVER_CONTEXT_MANAGER.__aexit__(None, None, None), _ASYNC_LOOP)
+    
     if _ASYNC_LOOP.is_running():
-        # Cancel any pending tasks
+        # Cancel any pending tasks and stop the loop
         for task in asyncio.all_tasks(_ASYNC_LOOP):
             task.cancel()
         _ASYNC_LOOP.call_soon_threadsafe(_ASYNC_LOOP.stop)
